@@ -27,7 +27,7 @@ private final class LoupeView: NSView {
         let local = convert(point, from: superview)
         let dx = local.x - bounds.midX
         let dy = local.y - bounds.midY
-        guard hypot(dx, dy) <= LoupeRenderer.radius else { return nil }
+        guard hypot(dx, dy) <= bounds.width * LoupeRenderer.radiusFraction else { return nil }
         return super.hitTest(point)
     }
 
@@ -64,9 +64,65 @@ private final class LoupeView: NSView {
 }
 
 @MainActor
+private final class LoupeSizeSettings: NSWindowController {
+    private let slider: NSSlider
+    private let valueLabel = NSTextField(labelWithString: "")
+    private let onChange: (Int) -> Void
+
+    init(diameter: Int, range: ClosedRange<Int>, onChange: @escaping (Int) -> Void) {
+        slider = NSSlider(value: Double(diameter), minValue: Double(range.lowerBound),
+                          maxValue: Double(range.upperBound), target: nil, action: nil)
+        self.onChange = onChange
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 312, height: 96),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init(window: window)
+        window.title = "观片镜大小"
+        window.level = .statusBar
+        window.isReleasedWhenClosed = false
+        window.center()
+
+        slider.target = self
+        slider.action = #selector(diameterChanged)
+        slider.isContinuous = true
+        slider.setAccessibilityLabel("观片镜直径")
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.stringValue = "\(diameter) pt"
+
+        let heading = NSStackView(views: [NSTextField(labelWithString: "直径"), valueLabel])
+        heading.distribution = .equalSpacing
+        let controls = NSStackView(views: [heading, slider])
+        controls.orientation = .vertical
+        controls.alignment = .leading
+        controls.spacing = 10
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        guard let content = window.contentView else { return }
+        content.addSubview(controls)
+        NSLayoutConstraint.activate([
+            controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            controls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            controls.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            heading.widthAnchor.constraint(equalTo: controls.widthAnchor),
+            slider.widthAnchor.constraint(equalTo: controls.widthAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func diameterChanged() {
+        let diameter = Int(slider.doubleValue.rounded())
+        valueLabel.stringValue = "\(diameter) pt"
+        onChange(diameter)
+    }
+}
+
+@MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private static let previewBundleID = "com.apple.Preview"
     private static let showWithPreviewKey = "ShowWithPreview"
+    private static let diameterKey = "LoupeDiameter"
+    private static let diameterRange = 100...260
+    private static let defaultDiameter = 160
 
     private let capture = DisplayCapture()
     private var statusItem: NSStatusItem?
@@ -74,12 +130,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
     private var previewItem: NSMenuItem?
     private var panel: LoupePanel?
     private var renderer: LoupeRenderer?
+    private var sizeSettings: LoupeSizeSettings?
     private var showing = false
     private var previewIsActive = false
 
     private var showWithPreview: Bool {
         get { UserDefaults.standard.bool(forKey: Self.showWithPreviewKey) }
         set { UserDefaults.standard.set(newValue, forKey: Self.showWithPreviewKey) }
+    }
+
+    private var diameter: Int {
+        let saved = UserDefaults.standard.object(forKey: Self.diameterKey) as? Int ?? Self.defaultDiameter
+        return min(max(saved, Self.diameterRange.lowerBound), Self.diameterRange.upperBound)
+    }
+
+    private var panelSide: CGFloat {
+        LoupeRenderer.panelSide(forDiameter: CGFloat(diameter))
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -91,10 +157,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
         let menu = NSMenu(title: "macOS Loupe")
         menu.delegate = self
         let show = item("显示观片镜", #selector(toggleLoupe))
+        let size = item("观片镜大小…", #selector(showSizeSettings))
         let preview = item("打开「预览」时显示", #selector(toggleShowWithPreview))
         let quit = NSMenuItem(title: "退出 macOS Loupe", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
-        menu.items = [show, preview, .separator(), quit]
+        menu.items = [show, size, preview, .separator(), quit]
         statusItem.menu = menu
         self.statusItem = statusItem
         showItem = show
@@ -157,6 +224,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
         if showing { removeLoupe() } else { showLoupe() }
     }
 
+    @objc private func showSizeSettings() {
+        if sizeSettings == nil {
+            sizeSettings = LoupeSizeSettings(diameter: diameter, range: Self.diameterRange) { [weak self] diameter in
+                self?.setDiameter(diameter)
+            }
+        }
+        NSApp.activate()
+        sizeSettings?.showWindow(nil)
+    }
+
+    private func setDiameter(_ diameter: Int) {
+        guard self.diameter != diameter else { return }
+        UserDefaults.standard.set(diameter, forKey: Self.diameterKey)
+        guard let panel else { return }
+        let side = panelSide
+        let origin = NSPoint(x: panel.frame.midX - side / 2, y: panel.frame.midY - side / 2)
+        panel.setFrame(NSRect(origin: origin, size: NSSize(width: side, height: side)), display: showing)
+        updateRendererPosition()
+    }
+
     private func showLoupe() {
         guard !showing else { return }
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
@@ -185,7 +272,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
             throw LoupeError("找不到原版观片镜资源，请运行 Scripts/import-loupe.sh 后重新构建。")
         }
 
-        let side = LoupeRenderer.panelSide
+        let side = panelSide
         let frame = NSRect(x: 0, y: 0, width: side, height: side)
         let view = LoupeView(frame: frame)
         view.setAccessibilityLabel("桌面观片镜")
@@ -230,7 +317,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
     }
 
     private func fitOnScreen(_ point: NSPoint, screen: NSScreen) -> NSPoint {
-        let inset = LoupeRenderer.panelSide / 2
+        let inset = panelSide / 2
         let safe = screen.visibleFrame.insetBy(dx: inset, dy: inset)
         guard !safe.isEmpty else { return point }
         return NSPoint(x: min(max(point.x, safe.minX), safe.maxX),
@@ -247,7 +334,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
 
     private func updateRendererPosition() {
         guard let panel else { return }
-        renderer?.move(to: NSPoint(x: panel.frame.midX, y: panel.frame.midY), scale: panel.backingScaleFactor)
+        renderer?.updateViewport(center: NSPoint(x: panel.frame.midX, y: panel.frame.midY),
+                                 side: panel.frame.width, scale: panel.backingScaleFactor)
     }
 
     private func putDownLoupe(horizontalVelocity: CGFloat) {

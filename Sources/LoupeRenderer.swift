@@ -11,10 +11,13 @@ struct LoupeError: LocalizedError {
 
 @MainActor
 final class LoupeRenderer: NSObject {
-    static let panelSide: CGFloat = 248
-    static let radius: CGFloat = panelSide * 197 / designSide
+    static let radiusFraction: CGFloat = 197 / designSide
     private static let designSide: CGFloat = 448
     private static let samplingMargin: CGFloat = 128
+
+    static func panelSide(forDiameter diameter: CGFloat) -> CGFloat {
+        (diameter / (2 * radiusFraction)).rounded(.up)
+    }
 
     private struct Pose {
         let angle: CGFloat
@@ -62,6 +65,7 @@ final class LoupeRenderer: NSObject {
     private var inFlightBuffer: CVPixelBuffer?
     private var displayFrame = CGRect.zero
     private var center = CGPoint.zero
+    private var panelSide: CGFloat = 0
     private var scale: CGFloat = 0
     private var scheduled = false
     private var needsFrame = false
@@ -118,9 +122,10 @@ final class LoupeRenderer: NSObject {
         return nil
     }
 
-    func move(to center: CGPoint, scale: CGFloat) {
-        guard self.center != center || self.scale != scale else { return }
+    func updateViewport(center: CGPoint, side: CGFloat, scale: CGFloat) {
+        guard self.center != center || panelSide != side || self.scale != scale else { return }
         self.center = center
+        panelSide = side
         self.scale = scale
         requestFrame()
     }
@@ -192,7 +197,7 @@ final class LoupeRenderer: NSObject {
     }
 
     private func requestFrame() {
-        guard pixelBuffer != nil, scale > 0 else { return }
+        guard pixelBuffer != nil, panelSide > 0, scale > 0 else { return }
         needsFrame = true
         guard !scheduled, inFlightBuffer == nil else { return }
         scheduled = true
@@ -229,9 +234,10 @@ final class LoupeRenderer: NSObject {
         guard needsFrame, let pixelBuffer, inFlightBuffer == nil else { return }
         needsFrame = false
 
-        let panelPixels = (Self.panelSide * scale).rounded()
+        let panelPixels = (panelSide * scale).rounded()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        if let view { output.frame = view.bounds }
         output.contentsScale = scale
         output.drawableSize = CGSize(width: panelPixels, height: panelPixels)
         CATransaction.commit()
@@ -252,11 +258,11 @@ final class LoupeRenderer: NSObject {
     }
 
     func renderFrame(to target: MTLTexture, from buffer: CVPixelBuffer) -> MTLCommandBuffer? {
-        guard let surface = CVPixelBufferGetIOSurface(buffer) else { return nil }
+        guard panelSide > 0, let surface = CVPixelBufferGetIOSurface(buffer) else { return nil }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         configureCompositor(panelPixels: target.width)
-        let unitsPerPoint = Self.designSide / Self.panelSide
+        let unitsPerPoint = Self.designSide / panelSide
         let halfSide = scene.bounds.width / 2
         background.bounds = CGRect(x: 0, y: 0, width: displayFrame.width * unitsPerPoint,
                                    height: displayFrame.height * unitsPerPoint)
@@ -281,7 +287,7 @@ final class LoupeRenderer: NSObject {
         guard let commands = queue.makeCommandBuffer(),
               let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return nil }
         var shape = SIMD3<Float>(Float(target.width) / Float(sceneTexture.width),
-                                 Float(Self.radius / Self.panelSide * pose.scale), Float(target.width))
+                                 Float(Self.radiusFraction * pose.scale), Float(target.width))
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(sceneTexture, index: 0)
         encoder.setFragmentBytes(&shape, length: MemoryLayout<SIMD3<Float>>.stride, index: 0)
