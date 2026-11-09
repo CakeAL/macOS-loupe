@@ -13,9 +13,13 @@ private final class LoupePanel: NSPanel {
 
 private final class LoupeView: NSView {
     var onMove: ((NSPoint) -> Void)?
+    var onPickUp: (() -> Void)?
+    var onPutDown: ((CGFloat) -> Void)?
     var onAppearanceChange: ((Bool) -> Void)?
     var contextMenu: NSMenu?
     private var dragOffset = NSPoint.zero
+    private var dragSample: (x: CGFloat, time: TimeInterval)?
+    private var horizontalVelocity: CGFloat = 0
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -31,11 +35,24 @@ private final class LoupeView: NSView {
         guard let frame = window?.frame else { return }
         let mouse = NSEvent.mouseLocation
         dragOffset = NSPoint(x: mouse.x - frame.midX, y: mouse.y - frame.midY)
+        dragSample = (mouse.x, event.timestamp)
+        horizontalVelocity = 0
+        onPickUp?()
     }
 
     override func mouseDragged(with event: NSEvent) {
         let mouse = NSEvent.mouseLocation
+        if let sample = dragSample, event.timestamp > sample.time {
+            horizontalVelocity = (mouse.x - sample.x) / (event.timestamp - sample.time)
+        }
+        dragSample = (mouse.x, event.timestamp)
         onMove?(NSPoint(x: mouse.x - dragOffset.x, y: mouse.y - dragOffset.y))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let sample = dragSample else { return }
+        dragSample = nil
+        onPutDown?(event.timestamp - sample.time <= 0.1 ? horizontalVelocity : 0)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? { contextMenu }
@@ -152,8 +169,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
             let panel = try preparePanel()
             let mouse = NSEvent.mouseLocation
             guard let screen = screen(at: mouse) else { return }
+            let center = fitOnScreen(mouse, screen: screen)
             showing = true
-            moveLoupe(to: fitOnScreen(mouse, screen: screen))
+            renderer?.putDown(onLeft: center.x < screen.frame.midX, animated: false)
+            moveLoupe(to: center)
             panel.orderFrontRegardless()
         } catch {
             showError("无法显示观片镜", detail: error.localizedDescription)
@@ -189,6 +208,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
         context.addItem(item("移除观片镜", #selector(removeLoupe)))
         view.contextMenu = context
         view.onMove = { [weak self] center in self?.moveLoupe(to: center) }
+        view.onPickUp = { [weak renderer] in renderer?.pickUp() }
+        view.onPutDown = { [weak self] velocity in self?.putDownLoupe(horizontalVelocity: velocity) }
         view.onAppearanceChange = { [weak renderer] dark in renderer?.setDarkAppearance(dark) }
         view.viewDidChangeEffectiveAppearance()
 
@@ -227,6 +248,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWi
     private func updateRendererPosition() {
         guard let panel else { return }
         renderer?.move(to: NSPoint(x: panel.frame.midX, y: panel.frame.midY), scale: panel.backingScaleFactor)
+    }
+
+    private func putDownLoupe(horizontalVelocity: CGFloat) {
+        guard showing, let panel else { return }
+        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        guard let screen = screen(at: center) else { return }
+        // Preview chooses a resting side using the projected horizontal release position.
+        let projectedX = center.x + horizontalVelocity * 0.499
+        renderer?.putDown(onLeft: projectedX < screen.frame.midX, animated: true)
     }
 
     func windowDidChangeBackingProperties(_ notification: Notification) {

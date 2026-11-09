@@ -10,13 +10,43 @@ struct LoupeError: LocalizedError {
 }
 
 @MainActor
-final class LoupeRenderer {
+final class LoupeRenderer: NSObject {
     static let panelSide: CGFloat = 248
-    static let radius: CGFloat = panelSide * 197 / 424
-    private static let designSide: CGFloat = 424
+    static let radius: CGFloat = panelSide * 197 / designSide
+    private static let designSide: CGFloat = 448
     private static let samplingMargin: CGFloat = 128
 
+    private struct Pose {
+        let angle: CGFloat
+        let scale: CGFloat
+
+        static let left = Pose(angle: .pi / 2, scale: 1)
+        static let right = Pose(angle: 0, scale: 1)
+        static let lifted = Pose(angle: 42 * .pi / 180, scale: 1.1)
+    }
+
+    private struct Spring {
+        let from: Pose
+        let to: Pose
+        let start: CFTimeInterval
+        let stiffness: Double
+        let damping: Double
+
+        func pose(at time: CFTimeInterval) -> Pose? {
+            let elapsed = max(0, time - start)
+            let decay = damping / 2
+            let envelope = exp(-decay * elapsed)
+            guard envelope > 0.001 else { return nil }
+            let frequency = sqrt(stiffness - decay * decay)
+            let phase = frequency * elapsed
+            let remaining = envelope * (cos(phase) + decay / frequency * sin(phase))
+            return Pose(angle: to.angle + (from.angle - to.angle) * remaining,
+                        scale: to.scale + (from.scale - to.scale) * remaining)
+        }
+    }
+
     private let package: PreviewLoupePackage
+    private weak var view: NSView?
     private let root = CALayer()
     private let scene = CALayer()
     private let background = CALayer()
@@ -35,6 +65,10 @@ final class LoupeRenderer {
     private var scale: CGFloat = 0
     private var scheduled = false
     private var needsFrame = false
+    private var restPose = Pose.right
+    private var pose = Pose.right
+    private var spring: Spring?
+    private var displayLink: CADisplayLink?
 
     init(packageURL: URL, view: NSView) throws {
         package = try PreviewLoupePackage(url: packageURL)
@@ -53,6 +87,8 @@ final class LoupeRenderer {
         let loupe = package.rootLayer
         lightGlass = Self.findLayer(in: loupe, named: "Light Mode")
         darkGlass = Self.findLayer(in: loupe, named: "Dark Mode")
+        self.view = view
+        super.init()
         root.masksToBounds = true
         let fullSide = Self.designSide + 2 * Self.samplingMargin
         scene.bounds = CGRect(x: 0, y: 0, width: fullSide, height: fullSide)
@@ -61,7 +97,8 @@ final class LoupeRenderer {
         background.magnificationFilter = .linear
         scene.addSublayer(background)
         // The CAML centers the outside disk at (187, 196) in a 400-point canvas.
-        loupe.position = CGPoint(x: fullSide / 2 + 13, y: fullSide / 2 + 4)
+        loupe.anchorPoint = CGPoint(x: 187 / loupe.bounds.width, y: 196 / loupe.bounds.height)
+        loupe.position = CGPoint(x: fullSide / 2, y: fullSide / 2)
         scene.addSublayer(loupe)
 
         output.device = device
@@ -104,7 +141,50 @@ final class LoupeRenderer {
         requestFrame()
     }
 
+    func pickUp() {
+        animate(to: .lifted, stiffness: 240, damping: 20, animated: true)
+    }
+
+    func putDown(onLeft: Bool, animated: Bool) {
+        restPose = onLeft ? .left : .right
+        animate(to: restPose, stiffness: 93, damping: 15, animated: animated)
+    }
+
+    private func animate(to target: Pose, stiffness: Double, damping: Double, animated: Bool) {
+        let now = CACurrentMediaTime()
+        if animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let view {
+            pose = spring?.pose(at: now) ?? pose
+            spring = Spring(from: pose, to: target, start: now, stiffness: stiffness, damping: damping)
+            if displayLink == nil {
+                let link = view.displayLink(target: self, selector: #selector(advanceMotion(_:)))
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+            }
+        } else {
+            endMotion(at: target)
+        }
+        requestFrame()
+    }
+
+    @objc private func advanceMotion(_ link: CADisplayLink) {
+        guard let spring else { return }
+        if let next = spring.pose(at: CACurrentMediaTime()) {
+            pose = next
+        } else {
+            endMotion(at: spring.to)
+        }
+        requestFrame()
+    }
+
+    private func endMotion(at target: Pose) {
+        pose = target
+        spring = nil
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
     func reset() {
+        endMotion(at: restPose)
         output.isHidden = true
         background.contents = nil
         pixelBuffer = nil
@@ -183,6 +263,8 @@ final class LoupeRenderer {
         background.position = CGPoint(x: halfSide + (displayFrame.midX - center.x) * unitsPerPoint,
                                       y: halfSide + (displayFrame.midY - center.y) * unitsPerPoint)
         background.contents = surface.takeUnretainedValue()
+        let transform = CGAffineTransform(rotationAngle: pose.angle).scaledBy(x: pose.scale, y: pose.scale)
+        package.rootLayer.setAffineTransform(transform)
         CATransaction.commit()
         guard let compositor, let sceneTexture else { return nil }
 
@@ -199,7 +281,7 @@ final class LoupeRenderer {
         guard let commands = queue.makeCommandBuffer(),
               let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return nil }
         var shape = SIMD3<Float>(Float(target.width) / Float(sceneTexture.width),
-                                 Float(Self.radius / Self.panelSide), Float(target.width))
+                                 Float(Self.radius / Self.panelSide * pose.scale), Float(target.width))
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(sceneTexture, index: 0)
         encoder.setFragmentBytes(&shape, length: MemoryLayout<SIMD3<Float>>.stride, index: 0)
